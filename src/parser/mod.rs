@@ -22,8 +22,39 @@ pub struct SymbolIndex {
 struct LangConfig {
     language: Language,
     extensions: &'static [&'static str],
-    /// (node_kind, name_field) pairs to extract
-    symbol_queries: Vec<(&'static str, NameExtractor)>,
+    /// (node_kind, name_field, kind_override_field) triples to extract
+    symbol_queries: Vec<SymbolQuery>,
+}
+
+struct SymbolQuery {
+    node_kind: &'static str,
+    name_extractor: NameExtractor,
+    /// How to determine the actual symbol kind (struct vs class vs enum, etc.)
+    kind_override: KindOverride,
+}
+
+/// Strategy for determining the actual kind of a symbol node.
+enum KindOverride {
+    /// Use the node's own kind (default behavior for most languages)
+    None,
+    /// Read a named field from the node (Swift: declaration_kind field)
+    Field(&'static str),
+    /// Look for an unnamed child keyword token (Kotlin: class vs interface vs enum)
+    Keyword(&'static [&'static str]),
+}
+
+impl SymbolQuery {
+    fn new(node_kind: &'static str, name_extractor: NameExtractor) -> Self {
+        Self { node_kind, name_extractor, kind_override: KindOverride::None }
+    }
+
+    fn with_kind_field(node_kind: &'static str, name_extractor: NameExtractor, kind_field: &'static str) -> Self {
+        Self { node_kind, name_extractor, kind_override: KindOverride::Field(kind_field) }
+    }
+
+    fn with_keyword(node_kind: &'static str, name_extractor: NameExtractor, keywords: &'static [&'static str]) -> Self {
+        Self { node_kind, name_extractor, kind_override: KindOverride::Keyword(keywords) }
+    }
 }
 
 #[allow(dead_code)]
@@ -107,14 +138,39 @@ impl SymbolIndex {
     ) {
         let kind = node.kind();
 
-        for (target_kind, extractor) in &config.symbol_queries {
-            if kind == *target_kind {
-                if let Some(name) = self.extract_name(node, extractor, source) {
+        for query in &config.symbol_queries {
+            if kind == query.node_kind {
+                if let Some(name) = self.extract_name(node, &query.name_extractor, source) {
                     let start = node.start_position().row as u32 + 1;
                     let end = node.end_position().row as u32 + 1;
                     let text = &source[node.byte_range()];
                     let hash = Self::hash_str(text);
-                    let symbol_kind = Self::normalize_kind(kind);
+
+                    // Determine kind: use override if available,
+                    // otherwise fall back to normalize_kind on the node type
+                    let symbol_kind = match &query.kind_override {
+                        KindOverride::None => Self::normalize_kind(kind),
+                        KindOverride::Field(field) => {
+                            node.child_by_field_name(field)
+                                .map(|n| Self::normalize_kind(source[n.byte_range()].trim()))
+                                .unwrap_or_else(|| Self::normalize_kind(kind))
+                        }
+                        KindOverride::Keyword(keywords) => {
+                            // Scan unnamed children for a matching keyword token
+                            let mut found_kind = Self::normalize_kind(kind);
+                            let mut cursor = node.walk();
+                            for child in node.children(&mut cursor) {
+                                if !child.is_named() {
+                                    let text = source[child.byte_range()].trim();
+                                    if keywords.contains(&text) {
+                                        found_kind = Self::normalize_kind(text);
+                                        break;
+                                    }
+                                }
+                            }
+                            found_kind
+                        }
+                    };
 
                     out.push(Symbol {
                         id: format!("{}::{}", file, name),
@@ -154,15 +210,17 @@ impl SymbolIndex {
 
     fn normalize_kind(tree_sitter_kind: &str) -> &str {
         match tree_sitter_kind {
-            "function_declaration" | "function_definition" | "function_item" => "function",
+            "function_declaration" | "function_definition" | "function_item" | "fun" => "function",
             "method_definition" | "method_declaration" => "method",
-            "class_declaration" | "class_definition" => "class",
-            "struct_item" | "struct_declaration" => "struct",
+            "class_declaration" | "class_definition" | "class" => "class",
+            "struct_item" | "struct_declaration" | "struct" => "struct",
             "impl_item" => "impl",
-            "enum_item" | "enum_declaration" => "enum",
-            "interface_declaration" => "interface",
-            "trait_item" | "trait_declaration" | "protocol_declaration" => "trait",
-            "object_declaration" => "object",
+            "enum_item" | "enum_declaration" | "enum" => "enum",
+            "interface_declaration" | "interface" => "interface",
+            "trait_item" | "trait_declaration" | "protocol_declaration" | "protocol" => "trait",
+            "object_declaration" | "object" => "object",
+            "actor" => "actor",
+            "extension" => "extension",
             "type_alias_declaration" | "type_item" | "type_declaration" => "type",
             "arrow_function" => "arrow_fn",
             "export_statement" => "export",
@@ -186,12 +244,12 @@ impl SymbolIndex {
                 language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 extensions: &["ts", "tsx"],
                 symbol_queries: vec![
-                    ("function_declaration", NameExtractor::Field("name")),
-                    ("class_declaration", NameExtractor::Field("name")),
-                    ("method_definition", NameExtractor::Field("name")),
-                    ("interface_declaration", NameExtractor::Field("name")),
-                    ("type_alias_declaration", NameExtractor::Field("name")),
-                    ("enum_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("function_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("class_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("method_definition", NameExtractor::Field("name")),
+                    SymbolQuery::new("interface_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("type_alias_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("enum_declaration", NameExtractor::Field("name")),
                 ],
             },
             // JavaScript
@@ -199,9 +257,9 @@ impl SymbolIndex {
                 language: tree_sitter_javascript::LANGUAGE.into(),
                 extensions: &["js", "jsx"],
                 symbol_queries: vec![
-                    ("function_declaration", NameExtractor::Field("name")),
-                    ("class_declaration", NameExtractor::Field("name")),
-                    ("method_definition", NameExtractor::Field("name")),
+                    SymbolQuery::new("function_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("class_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("method_definition", NameExtractor::Field("name")),
                 ],
             },
             // Rust
@@ -209,12 +267,12 @@ impl SymbolIndex {
                 language: tree_sitter_rust::LANGUAGE.into(),
                 extensions: &["rs"],
                 symbol_queries: vec![
-                    ("function_item", NameExtractor::Field("name")),
-                    ("struct_item", NameExtractor::Field("name")),
-                    ("enum_item", NameExtractor::Field("name")),
-                    ("trait_item", NameExtractor::Field("name")),
-                    ("impl_item", NameExtractor::Field("type")),
-                    ("type_item", NameExtractor::Field("name")),
+                    SymbolQuery::new("function_item", NameExtractor::Field("name")),
+                    SymbolQuery::new("struct_item", NameExtractor::Field("name")),
+                    SymbolQuery::new("enum_item", NameExtractor::Field("name")),
+                    SymbolQuery::new("trait_item", NameExtractor::Field("name")),
+                    SymbolQuery::new("impl_item", NameExtractor::Field("type")),
+                    SymbolQuery::new("type_item", NameExtractor::Field("name")),
                 ],
             },
             // Python
@@ -222,8 +280,8 @@ impl SymbolIndex {
                 language: tree_sitter_python::LANGUAGE.into(),
                 extensions: &["py"],
                 symbol_queries: vec![
-                    ("function_definition", NameExtractor::Field("name")),
-                    ("class_definition", NameExtractor::Field("name")),
+                    SymbolQuery::new("function_definition", NameExtractor::Field("name")),
+                    SymbolQuery::new("class_definition", NameExtractor::Field("name")),
                 ],
             },
             // C#
@@ -231,12 +289,12 @@ impl SymbolIndex {
                 language: tree_sitter_c_sharp::LANGUAGE.into(),
                 extensions: &["cs"],
                 symbol_queries: vec![
-                    ("method_declaration", NameExtractor::Field("name")),
-                    ("class_declaration", NameExtractor::Field("name")),
-                    ("interface_declaration", NameExtractor::Field("name")),
-                    ("struct_declaration", NameExtractor::Field("name")),
-                    ("enum_declaration", NameExtractor::Field("name")),
-                    ("namespace_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("method_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("class_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("interface_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("struct_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("enum_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("namespace_declaration", NameExtractor::Field("name")),
                 ],
             },
             // Go
@@ -244,9 +302,9 @@ impl SymbolIndex {
                 language: tree_sitter_go::LANGUAGE.into(),
                 extensions: &["go"],
                 symbol_queries: vec![
-                    ("function_declaration", NameExtractor::Field("name")),
-                    ("method_declaration", NameExtractor::Field("name")),
-                    ("type_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("function_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("method_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("type_declaration", NameExtractor::Field("name")),
                 ],
             },
             // Java
@@ -254,10 +312,10 @@ impl SymbolIndex {
                 language: tree_sitter_java::LANGUAGE.into(),
                 extensions: &["java"],
                 symbol_queries: vec![
-                    ("method_declaration", NameExtractor::Field("name")),
-                    ("class_declaration", NameExtractor::Field("name")),
-                    ("interface_declaration", NameExtractor::Field("name")),
-                    ("enum_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("method_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("class_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("interface_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("enum_declaration", NameExtractor::Field("name")),
                 ],
             },
             // C
@@ -265,10 +323,10 @@ impl SymbolIndex {
                 language: tree_sitter_c::LANGUAGE.into(),
                 extensions: &["c", "h"],
                 symbol_queries: vec![
-                    ("function_definition", NameExtractor::Field("declarator")),
-                    ("struct_specifier", NameExtractor::Field("name")),
-                    ("enum_specifier", NameExtractor::Field("name")),
-                    ("type_definition", NameExtractor::Field("declarator")),
+                    SymbolQuery::new("function_definition", NameExtractor::Field("declarator")),
+                    SymbolQuery::new("struct_specifier", NameExtractor::Field("name")),
+                    SymbolQuery::new("enum_specifier", NameExtractor::Field("name")),
+                    SymbolQuery::new("type_definition", NameExtractor::Field("declarator")),
                 ],
             },
             // C++
@@ -276,11 +334,11 @@ impl SymbolIndex {
                 language: tree_sitter_cpp::LANGUAGE.into(),
                 extensions: &["cpp", "cc", "cxx", "hpp"],
                 symbol_queries: vec![
-                    ("function_definition", NameExtractor::Field("declarator")),
-                    ("class_specifier", NameExtractor::Field("name")),
-                    ("struct_specifier", NameExtractor::Field("name")),
-                    ("enum_specifier", NameExtractor::Field("name")),
-                    ("namespace_definition", NameExtractor::Field("name")),
+                    SymbolQuery::new("function_definition", NameExtractor::Field("declarator")),
+                    SymbolQuery::new("class_specifier", NameExtractor::Field("name")),
+                    SymbolQuery::new("struct_specifier", NameExtractor::Field("name")),
+                    SymbolQuery::new("enum_specifier", NameExtractor::Field("name")),
+                    SymbolQuery::new("namespace_definition", NameExtractor::Field("name")),
                 ],
             },
             // Ruby
@@ -288,10 +346,10 @@ impl SymbolIndex {
                 language: tree_sitter_ruby::LANGUAGE.into(),
                 extensions: &["rb"],
                 symbol_queries: vec![
-                    ("method", NameExtractor::Field("name")),
-                    ("singleton_method", NameExtractor::Field("name")),
-                    ("class", NameExtractor::Field("name")),
-                    ("module", NameExtractor::Field("name")),
+                    SymbolQuery::new("method", NameExtractor::Field("name")),
+                    SymbolQuery::new("singleton_method", NameExtractor::Field("name")),
+                    SymbolQuery::new("class", NameExtractor::Field("name")),
+                    SymbolQuery::new("module", NameExtractor::Field("name")),
                 ],
             },
             // PHP
@@ -299,35 +357,34 @@ impl SymbolIndex {
                 language: tree_sitter_php::LANGUAGE_PHP.into(),
                 extensions: &["php"],
                 symbol_queries: vec![
-                    ("function_definition", NameExtractor::Field("name")),
-                    ("method_declaration", NameExtractor::Field("name")),
-                    ("class_declaration", NameExtractor::Field("name")),
-                    ("interface_declaration", NameExtractor::Field("name")),
-                    ("trait_declaration", NameExtractor::Field("name")),
-                    ("enum_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("function_definition", NameExtractor::Field("name")),
+                    SymbolQuery::new("method_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("class_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("interface_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("trait_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("enum_declaration", NameExtractor::Field("name")),
                 ],
             },
-            // Swift
+            // Swift — uses class_declaration for class/struct/enum/protocol/actor/extension
+            // with a declaration_kind field to differentiate
             LangConfig {
                 language: tree_sitter_swift::LANGUAGE.into(),
                 extensions: &["swift"],
                 symbol_queries: vec![
-                    ("function_declaration", NameExtractor::Field("name")),
-                    ("class_declaration", NameExtractor::Field("name")),
-                    ("struct_declaration", NameExtractor::Field("name")),
-                    ("enum_declaration", NameExtractor::Field("name")),
-                    ("protocol_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("function_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::with_kind_field("class_declaration", NameExtractor::Field("name"), "declaration_kind"),
+                    SymbolQuery::new("protocol_declaration", NameExtractor::Field("name")),
                 ],
             },
-            // Kotlin
+            // Kotlin — uses class_declaration for class/interface/enum
+            // with unnamed keyword children to differentiate
             LangConfig {
                 language: tree_sitter_kotlin_ng::LANGUAGE.into(),
                 extensions: &["kt", "kts"],
                 symbol_queries: vec![
-                    ("function_declaration", NameExtractor::Field("name")),
-                    ("class_declaration", NameExtractor::Field("name")),
-                    ("object_declaration", NameExtractor::Field("name")),
-                    ("interface_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::new("function_declaration", NameExtractor::Field("name")),
+                    SymbolQuery::with_keyword("class_declaration", NameExtractor::Field("name"), &["class", "interface", "enum"]),
+                    SymbolQuery::new("object_declaration", NameExtractor::Field("name")),
                 ],
             },
         ]

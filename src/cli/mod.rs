@@ -493,7 +493,8 @@ fn cmd_status(repo: &str) -> Result<()> {
             } else {
                 format!("ttl={}s", entry.ttl_seconds)
             };
-            println!("  {} {} ({}) [{}]", "|".dimmed(), entry.symbol_id, entry.locked_at.dimmed(), status);
+            let mode_str = if entry.mode == "read" { " (read)" } else { "" };
+            println!("  {} {}{} ({}) [{}]", "|".dimmed(), entry.symbol_id, mode_str, entry.locked_at.dimmed(), status);
         }
     }
 

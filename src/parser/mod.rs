@@ -161,7 +161,8 @@ impl SymbolIndex {
             "impl_item" => "impl",
             "enum_item" | "enum_declaration" => "enum",
             "interface_declaration" => "interface",
-            "trait_item" | "trait_declaration" => "trait",
+            "trait_item" | "trait_declaration" | "protocol_declaration" => "trait",
+            "object_declaration" => "object",
             "type_alias_declaration" | "type_item" | "type_declaration" => "type",
             "arrow_function" => "arrow_fn",
             "export_statement" => "export",
@@ -304,6 +305,29 @@ impl SymbolIndex {
                     ("interface_declaration", NameExtractor::Field("name")),
                     ("trait_declaration", NameExtractor::Field("name")),
                     ("enum_declaration", NameExtractor::Field("name")),
+                ],
+            },
+            // Swift
+            LangConfig {
+                language: tree_sitter_swift::LANGUAGE.into(),
+                extensions: &["swift"],
+                symbol_queries: vec![
+                    ("function_declaration", NameExtractor::Field("name")),
+                    ("class_declaration", NameExtractor::Field("name")),
+                    ("struct_declaration", NameExtractor::Field("name")),
+                    ("enum_declaration", NameExtractor::Field("name")),
+                    ("protocol_declaration", NameExtractor::Field("name")),
+                ],
+            },
+            // Kotlin
+            LangConfig {
+                language: tree_sitter_kotlin_ng::LANGUAGE.into(),
+                extensions: &["kt", "kts"],
+                symbol_queries: vec![
+                    ("function_declaration", NameExtractor::Field("name")),
+                    ("class_declaration", NameExtractor::Field("name")),
+                    ("object_declaration", NameExtractor::Field("name")),
+                    ("interface_declaration", NameExtractor::Field("name")),
                 ],
             },
         ]
@@ -874,5 +898,95 @@ function helper_function() {
         find_sym(&symbols, "Authenticatable");
         find_sym(&symbols, "HasRoles");
         find_sym(&symbols, "helper_function");
+    }
+
+    // ── 21. Swift ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_swift() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "Sources/App.swift", r#"
+func greet(name: String) -> String {
+    return "Hello, \(name)"
+}
+
+class UserService {
+    func createUser(name: String) {}
+    func deleteUser(id: Int) {}
+}
+
+struct Point {
+    var x: Double
+    var y: Double
+}
+
+enum Direction {
+    case north
+    case south
+    case east
+    case west
+}
+
+protocol Drawable {
+    func draw()
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        find_sym(&symbols, "greet");
+        assert_eq!(find_sym(&symbols, "greet").kind, "function");
+
+        find_sym(&symbols, "UserService");
+        assert_eq!(find_sym(&symbols, "UserService").kind, "class");
+
+        find_sym(&symbols, "Point");
+        assert_eq!(find_sym(&symbols, "Point").kind, "struct");
+
+        find_sym(&symbols, "Direction");
+        assert_eq!(find_sym(&symbols, "Direction").kind, "enum");
+
+        find_sym(&symbols, "Drawable");
+        assert_eq!(find_sym(&symbols, "Drawable").kind, "trait");
+    }
+
+    // ── 22. Kotlin ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_kotlin() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/main.kt", r#"
+fun greet(name: String): String {
+    return "Hello, $name"
+}
+
+class UserService {
+    fun createUser(name: String) {}
+    fun deleteUser(id: Int) {}
+}
+
+object Singleton {
+    fun instance(): Singleton = this
+}
+
+interface Repository {
+    fun save()
+    fun delete()
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        find_sym(&symbols, "greet");
+        assert_eq!(find_sym(&symbols, "greet").kind, "function");
+
+        find_sym(&symbols, "UserService");
+        assert_eq!(find_sym(&symbols, "UserService").kind, "class");
+
+        find_sym(&symbols, "Singleton");
+        assert_eq!(find_sym(&symbols, "Singleton").kind, "object");
+
+        find_sym(&symbols, "Repository");
+        assert_eq!(find_sym(&symbols, "Repository").kind, "interface");
     }
 }

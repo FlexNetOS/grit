@@ -42,6 +42,14 @@ pub enum Command {
         #[arg(long, default_value = "600")]
         ttl: u64,
 
+        /// Wait timeout in seconds if blocked (retries with backoff until granted or timeout)
+        #[arg(short, long, default_value = "0")]
+        wait: u64,
+
+        /// Lock mode: "read" for shared access, "write" for exclusive (default: write)
+        #[arg(long, default_value = "write")]
+        mode: String,
+
         /// Symbols to claim (e.g. "auth.ts::login" "utils.ts::hash")
         symbols: Vec<String>,
     },
@@ -206,7 +214,7 @@ pub fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Command::Init => cmd_init(&cli.repo),
-        Command::Claim { agent, intent, ttl, symbols } => cmd_claim(&cli.repo, &agent, &intent, ttl, &symbols),
+        Command::Claim { agent, intent, ttl, wait, mode, symbols } => cmd_claim(&cli.repo, &agent, &intent, ttl, wait, &mode, &symbols),
         Command::Release { agent, symbols } => cmd_release(&cli.repo, &agent, &symbols),
         Command::Status => cmd_status(&cli.repo),
         Command::Symbols { file } => cmd_symbols(&cli.repo, file.as_deref()),
@@ -314,79 +322,113 @@ fn cmd_init(repo: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, symbols: &[String]) -> Result<()> {
+fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, wait: u64, mode: &str, symbols: &[String]) -> Result<()> {
+    if mode != "read" && mode != "write" {
+        anyhow::bail!("Invalid mode '{}': must be 'read' or 'write'", mode);
+    }
+
     let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
     let db = Database::open(&dir.join("registry.db"))?; // for symbol queries
 
-    let mut granted = Vec::new();
-    let mut blocked = Vec::new();
+    let deadline = if wait > 0 {
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(wait))
+    } else {
+        None
+    };
+    let mut backoff_secs = 1u64;
 
-    for sym_id in symbols {
-        match lock_store.try_lock(sym_id, agent, intent, ttl)? {
-            LockResult::Granted => granted.push(sym_id.clone()),
-            LockResult::Blocked { by_agent, by_intent } => {
-                blocked.push((sym_id.clone(), by_agent, by_intent));
-            }
-        }
-    }
+    loop {
+        let mut granted = Vec::new();
+        let mut blocked = Vec::new();
 
-    // Create worktree for the agent if any grants succeeded
-    if !granted.is_empty() {
-        let git_repo = GitRepo::open(repo)?;
-        match git_repo.create_worktree(agent) {
-            Ok(wt_path) => {
-
-                println!("{} Worktree: {}", "+".cyan(), wt_path.display());
-            }
-            Err(e) => {
-                // Worktree may already exist, that's fine
-                let msg = e.to_string();
-                if !msg.contains("already exists") {
-                    eprintln!("  warn: could not create worktree: {}", e);
+        for sym_id in symbols {
+            match lock_store.try_lock(sym_id, agent, intent, ttl, mode)? {
+                LockResult::Granted => granted.push(sym_id.clone()),
+                LockResult::Blocked { by_agent, by_intent } => {
+                    blocked.push((sym_id.clone(), by_agent, by_intent));
                 }
             }
         }
-    }
 
-    if !granted.is_empty() {
+        // If nothing is blocked, or no --wait, or deadline passed: finalize
+        let should_retry = !blocked.is_empty()
+            && deadline.is_some()
+            && std::time::Instant::now() < deadline.unwrap();
 
-        println!("{} Granted:", "+".green());
-        for s in &granted {
-            println!("  {} {}", ">".green(), s);
-        }
-
-        // Notify
-        let room = Room::new(&dir);
-        room.notify(&RoomEvent {
-            event_type: EventType::Claimed,
-            agent: agent.to_string(),
-            symbols: granted,
-        });
-    }
-
-    if !blocked.is_empty() {
-
-        println!("{} Blocked:", "x".red());
-        for (s, by, intent) in &blocked {
-            println!("  {} {} -- held by {} ({})", ">".red(), s, by, intent);
-        }
-
-        // Suggest available symbols in the same files
-        let files: Vec<&str> = symbols.iter().filter_map(|s| s.split("::").next()).collect();
-        let available = db.available_symbols_in_files(&files)?;
-        if !available.is_empty() {
-            println!("\n{} Available in same files:", "?".yellow());
-            for s in &available {
-                println!("  {} {}", ">".yellow(), s);
+        if !should_retry {
+            // Create worktree for the agent if any grants succeeded
+            if !granted.is_empty() {
+                let git_repo = GitRepo::open(repo)?;
+                match git_repo.create_worktree(agent) {
+                    Ok(wt_path) => {
+                        println!("{} Worktree: {}", "+".cyan(), wt_path.display());
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.contains("already exists") {
+                            eprintln!("  warn: could not create worktree: {}", e);
+                        }
+                    }
+                }
             }
-        }
-    }
 
-    if blocked.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!("Some symbols are blocked")
+            if !granted.is_empty() {
+                println!("{} Granted:", "+".green());
+                for s in &granted {
+                    println!("  {} {}", ">".green(), s);
+                }
+
+                let room = Room::new(&dir);
+                room.notify(&RoomEvent {
+                    event_type: EventType::Claimed,
+                    agent: agent.to_string(),
+                    symbols: granted,
+                });
+            }
+
+            if !blocked.is_empty() {
+                println!("{} Blocked:", "x".red());
+                for (s, by, intent) in &blocked {
+                    println!("  {} {} -- held by {} ({})", ">".red(), s, by, intent);
+                }
+
+                let files: Vec<&str> = symbols.iter().filter_map(|s| s.split("::").next()).collect();
+                let available = db.available_symbols_in_files(&files)?;
+                if !available.is_empty() {
+                    println!("\n{} Available in same files:", "?".yellow());
+                    for s in &available {
+                        println!("  {} {}", ">".yellow(), s);
+                    }
+                }
+            }
+
+            return if blocked.is_empty() {
+                Ok(())
+            } else {
+                anyhow::bail!("Some symbols are blocked")
+            };
+        }
+
+        // Retrying: print waiting message for each blocked symbol
+        for (s, by, _intent) in &blocked {
+            println!("Waiting for {} (held by {})...", s, by);
+        }
+
+        // Release symbols we just locked so they aren't held during sleep
+        // (all-or-nothing: either all symbols are claimed or none)
+        for s in &granted {
+            let _ = lock_store.release(s, agent);
+        }
+
+        // Sleep with backoff: 1s -> 2s -> 4s -> 5s (cap), never past deadline
+        let remaining = deadline.unwrap().saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            continue; // one final attempt
+        }
+        let sleep_dur = std::time::Duration::from_secs(backoff_secs).min(remaining);
+        std::thread::sleep(sleep_dur);
+        backoff_secs = (backoff_secs * 2).min(5);
     }
 }
 
@@ -990,6 +1032,7 @@ mod tests {
             intent: "testing".to_string(),
             locked_at: locked_at.to_string(),
             ttl_seconds: ttl,
+            mode: "write".to_string(),
         }
     }
 
@@ -1012,4 +1055,52 @@ mod tests {
         let entry = make_entry("not-a-timestamp", 600);
         assert!(is_entry_expired_local(&entry));
     }
+
+    // ── claim wait/backoff tests ──
+
+    #[test]
+    fn test_claim_wait_backoff_gives_up_after_timeout() {
+        // Set up a temp repo with grit init
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_str().unwrap();
+
+        // Init git repo
+        std::process::Command::new("git")
+            .args(["init", repo])
+            .output()
+            .unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn hello() {}
+").unwrap();
+        std::process::Command::new("git")
+            .args(["-C", repo, "add", "."])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", repo, "commit", "-m", "init"])
+            .output()
+            .unwrap();
+
+        // Init grit
+        cmd_init(repo).unwrap();
+
+        // Blocker agent claims a symbol
+        let lock_store = resolve_lock_store(repo).unwrap();
+        let result = lock_store.try_lock("main.rs::hello", "blocker", "blocking", 600, "write").unwrap();
+        assert!(matches!(result, LockResult::Granted));
+
+        // Agent-2 tries to claim with --wait 2 (should timeout after ~2s)
+        let start = std::time::Instant::now();
+        let err = cmd_claim(repo, "agent-2", "want it", 600, 2, "write", &["main.rs::hello".to_string()]);
+        let elapsed = start.elapsed();
+
+        // Should have failed (blocked)
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("blocked"), "Expected 'blocked' in error: {}", msg);
+
+        // Should have waited at least 1s (first backoff) but not more than 4s
+        assert!(elapsed.as_secs() >= 1, "Should have retried at least once, elapsed: {:?}", elapsed);
+        assert!(elapsed.as_secs() <= 4, "Should not wait too long, elapsed: {:?}", elapsed);
+    }
+
 }

@@ -87,7 +87,7 @@ impl Database {
                 mode        TEXT DEFAULT 'write',
                 locked_at   TEXT DEFAULT (datetime('now')),
                 ttl_seconds INTEGER DEFAULT 600,
-                PRIMARY KEY (symbol_id)
+                PRIMARY KEY (symbol_id, agent_id)
             );
 
             CREATE TABLE IF NOT EXISTS deps (

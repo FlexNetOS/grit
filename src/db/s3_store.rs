@@ -258,13 +258,14 @@ impl S3LockStore {
 }
 
 impl LockStore for S3LockStore {
-    fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64) -> Result<LockResult> {
+    fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64, mode: &str) -> Result<LockResult> {
         let entry = LockEntry {
             symbol_id: symbol_id.to_string(),
             agent_id: agent_id.to_string(),
             intent: intent.to_string(),
             locked_at: Utc::now().to_rfc3339(),
             ttl_seconds,
+            mode: mode.to_string(),
         };
 
         // Try atomic PUT
@@ -294,6 +295,14 @@ impl LockStore for S3LockStore {
                         by_intent: new_existing.intent,
                     });
                 }
+            }
+
+            // Read/write compatibility: read + read = OK
+            if mode == "read" && existing.mode == "read" {
+                // For S3, we allow the read claim without overwriting the existing entry.
+                // The caller gets Granted but the S3 object still belongs to the first reader.
+                // This is a simplification -- S3 doesn't support multi-row locks.
+                return Ok(LockResult::Granted);
             }
 
             return Ok(LockResult::Blocked {
@@ -370,6 +379,7 @@ impl LockStore for S3LockStore {
                     intent: entry.intent,
                     locked_at: now.clone(),
                     ttl_seconds,
+                    mode: entry.mode,
                 };
                 self.put_lock(&updated)?;
                 count += 1;

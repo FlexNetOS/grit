@@ -9,6 +9,12 @@ pub struct LockEntry {
     pub intent: String,
     pub locked_at: String,
     pub ttl_seconds: u64,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_mode() -> String {
+    "write".to_string()
 }
 
 /// Result of a lock attempt
@@ -23,7 +29,7 @@ pub enum LockResult {
 
 /// Abstract lock storage — implementations: SQLite (local), S3-compatible (cloud)
 pub trait LockStore: Send + Sync {
-    fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64) -> Result<LockResult>;
+    fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64, mode: &str) -> Result<LockResult>;
     fn release(&self, symbol_id: &str, agent_id: &str) -> Result<()>;
     fn release_all(&self, agent_id: &str) -> Result<usize>;
     fn all_locks(&self) -> Result<Vec<LockEntry>>;

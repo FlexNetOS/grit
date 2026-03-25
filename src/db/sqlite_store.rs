@@ -24,43 +24,67 @@ impl SqliteLockStore {
 }
 
 impl LockStore for SqliteLockStore {
-    fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64) -> Result<LockResult> {
+    fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64, mode: &str) -> Result<LockResult> {
         let conn = self.conn()?;
 
-        // Clean up expired lock on this symbol
+        // Clean up expired locks on this symbol
         conn.execute(
             "DELETE FROM locks WHERE symbol_id = ?1
              AND (julianday('now') - julianday(locked_at)) * 86400 > ttl_seconds",
             params![symbol_id],
         )?;
 
-        // Check existing lock
-        let existing: Option<(String, String)> = conn.query_row(
-            "SELECT agent_id, intent FROM locks WHERE symbol_id = ?1",
-            params![symbol_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).ok();
+        // Check existing locks on this symbol (there can be multiple read locks)
+        let mut stmt = conn.prepare(
+            "SELECT agent_id, intent, COALESCE(mode, 'write') FROM locks WHERE symbol_id = ?1"
+        )?;
+        let existing: Vec<(String, String, String)> = stmt.query_map(params![symbol_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?.collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
 
-        match existing {
-            Some((ref agent, _)) if agent == agent_id => {
-                conn.execute(
-                    "UPDATE locks SET intent = ?1, locked_at = datetime('now'), ttl_seconds = ?4
-                     WHERE symbol_id = ?2 AND agent_id = ?3",
-                    params![intent, symbol_id, agent_id, ttl_seconds],
-                )?;
-                Ok(LockResult::Granted)
-            }
-            Some((by_agent, by_intent)) => {
-                Ok(LockResult::Blocked { by_agent, by_intent })
-            }
-            None => {
-                conn.execute(
-                    "INSERT INTO locks (symbol_id, agent_id, intent, ttl_seconds) VALUES (?1, ?2, ?3, ?4)",
-                    params![symbol_id, agent_id, intent, ttl_seconds],
-                )?;
-                Ok(LockResult::Granted)
-            }
+        if existing.is_empty() {
+            conn.execute(
+                "INSERT INTO locks (symbol_id, agent_id, intent, mode, ttl_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![symbol_id, agent_id, intent, mode, ttl_seconds],
+            )?;
+            return Ok(LockResult::Granted);
         }
+
+        // Same agent already holds a lock on this symbol -- update it
+        if existing.iter().any(|(a, _, _)| a == agent_id) {
+            conn.execute(
+                "UPDATE locks SET intent = ?1, mode = ?2, locked_at = datetime('now'), ttl_seconds = ?5
+                 WHERE symbol_id = ?3 AND agent_id = ?4",
+                params![intent, mode, symbol_id, agent_id, ttl_seconds],
+            )?;
+            return Ok(LockResult::Granted);
+        }
+
+        // Different agent(s) hold locks -- apply read/write compatibility:
+        //   write request: blocked by ANY other agent's lock
+        //   read request: blocked only by a WRITE lock from another agent
+        if mode == "read" {
+            if let Some((by_agent, by_intent, _)) = existing.iter().find(|(_, _, m)| m == "write") {
+                return Ok(LockResult::Blocked {
+                    by_agent: by_agent.clone(),
+                    by_intent: by_intent.clone(),
+                });
+            }
+            // All existing locks are read -- grant (insert new read lock row)
+            conn.execute(
+                "INSERT INTO locks (symbol_id, agent_id, intent, mode, ttl_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![symbol_id, agent_id, intent, mode, ttl_seconds],
+            )?;
+            return Ok(LockResult::Granted);
+        }
+
+        // Write lock requested -- blocked by any other agent's lock
+        let (by_agent, by_intent, _) = &existing[0];
+        Ok(LockResult::Blocked {
+            by_agent: by_agent.clone(),
+            by_intent: by_intent.clone(),
+        })
     }
 
     fn release(&self, symbol_id: &str, agent_id: &str) -> Result<()> {
@@ -84,7 +108,7 @@ impl LockStore for SqliteLockStore {
     fn all_locks(&self) -> Result<Vec<LockEntry>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT symbol_id, agent_id, intent, locked_at, COALESCE(ttl_seconds, 600)
+            "SELECT symbol_id, agent_id, intent, locked_at, COALESCE(ttl_seconds, 600), COALESCE(mode, 'write')
              FROM locks ORDER BY agent_id, symbol_id"
         )?;
         let rows = stmt.query_map([], |row| {
@@ -94,6 +118,7 @@ impl LockStore for SqliteLockStore {
                 intent: row.get(2)?,
                 locked_at: row.get(3)?,
                 ttl_seconds: row.get::<_, i64>(4)? as u64,
+                mode: row.get(5)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -154,7 +179,7 @@ mod tests {
                      mode        TEXT DEFAULT 'write',
                      locked_at   TEXT DEFAULT (datetime('now')),
                      ttl_seconds INTEGER DEFAULT 600,
-                     PRIMARY KEY (symbol_id)
+                     PRIMARY KEY (symbol_id, agent_id)
                  );
                  CREATE INDEX IF NOT EXISTS idx_locks_agent ON locks(agent_id);",
             )
@@ -169,20 +194,16 @@ mod tests {
     fn test_lock_and_release() {
         let (_dir, store) = setup();
 
-        // Lock a symbol
-        let result = store.try_lock("sym::foo", "agent-1", "editing foo", 600).unwrap();
+        let result = store.try_lock("sym::foo", "agent-1", "editing foo", 600, "write").unwrap();
         assert!(matches!(result, LockResult::Granted));
 
-        // Verify it appears in all_locks
         let locks = store.all_locks().unwrap();
         assert_eq!(locks.len(), 1);
         assert_eq!(locks[0].symbol_id, "sym::foo");
         assert_eq!(locks[0].agent_id, "agent-1");
+        assert_eq!(locks[0].mode, "write");
 
-        // Release it
         store.release("sym::foo", "agent-1").unwrap();
-
-        // Verify it's gone
         let locks = store.all_locks().unwrap();
         assert!(locks.is_empty());
     }
@@ -191,12 +212,10 @@ mod tests {
     fn test_lock_blocked_by_other_agent() {
         let (_dir, store) = setup();
 
-        // Agent A locks
-        let result = store.try_lock("sym::bar", "agent-A", "refactoring", 600).unwrap();
+        let result = store.try_lock("sym::bar", "agent-A", "refactoring", 600, "write").unwrap();
         assert!(matches!(result, LockResult::Granted));
 
-        // Agent B tries the same symbol
-        let result = store.try_lock("sym::bar", "agent-B", "also refactoring", 600).unwrap();
+        let result = store.try_lock("sym::bar", "agent-B", "also refactoring", 600, "write").unwrap();
         match result {
             LockResult::Blocked { by_agent, by_intent } => {
                 assert_eq!(by_agent, "agent-A");
@@ -210,15 +229,12 @@ mod tests {
     fn test_same_agent_relock() {
         let (_dir, store) = setup();
 
-        // Agent A locks
-        let result = store.try_lock("sym::baz", "agent-A", "first pass", 300).unwrap();
+        let result = store.try_lock("sym::baz", "agent-A", "first pass", 300, "write").unwrap();
         assert!(matches!(result, LockResult::Granted));
 
-        // Agent A locks again (should refresh TTL, still Granted)
-        let result = store.try_lock("sym::baz", "agent-A", "second pass", 900).unwrap();
+        let result = store.try_lock("sym::baz", "agent-A", "second pass", 900, "write").unwrap();
         assert!(matches!(result, LockResult::Granted));
 
-        // Verify only one lock exists and TTL was updated
         let locks = store.all_locks().unwrap();
         assert_eq!(locks.len(), 1);
         assert_eq!(locks[0].ttl_seconds, 900);
@@ -229,13 +245,10 @@ mod tests {
     fn test_release_all() {
         let (_dir, store) = setup();
 
-        // Agent locks 3 symbols
-        store.try_lock("sym::a", "agent-1", "intent-a", 600).unwrap();
-        store.try_lock("sym::b", "agent-1", "intent-b", 600).unwrap();
-        store.try_lock("sym::c", "agent-1", "intent-c", 600).unwrap();
-
-        // Also one lock by another agent (should not be released)
-        store.try_lock("sym::d", "agent-2", "intent-d", 600).unwrap();
+        store.try_lock("sym::a", "agent-1", "intent-a", 600, "write").unwrap();
+        store.try_lock("sym::b", "agent-1", "intent-b", 600, "write").unwrap();
+        store.try_lock("sym::c", "agent-1", "intent-c", 600, "write").unwrap();
+        store.try_lock("sym::d", "agent-2", "intent-d", 600, "write").unwrap();
 
         let count = store.release_all("agent-1").unwrap();
         assert_eq!(count, 3);
@@ -249,14 +262,13 @@ mod tests {
     fn test_all_locks() {
         let (_dir, store) = setup();
 
-        store.try_lock("sym::x", "agent-A", "ix", 600).unwrap();
-        store.try_lock("sym::y", "agent-A", "iy", 600).unwrap();
-        store.try_lock("sym::z", "agent-B", "iz", 600).unwrap();
+        store.try_lock("sym::x", "agent-A", "ix", 600, "write").unwrap();
+        store.try_lock("sym::y", "agent-A", "iy", 600, "write").unwrap();
+        store.try_lock("sym::z", "agent-B", "iz", 600, "write").unwrap();
 
         let locks = store.all_locks().unwrap();
         assert_eq!(locks.len(), 3);
 
-        // Verify ordering is by agent_id then symbol_id
         let ids: Vec<(&str, &str)> = locks.iter().map(|l| (l.agent_id.as_str(), l.symbol_id.as_str())).collect();
         assert_eq!(ids, vec![("agent-A", "sym::x"), ("agent-A", "sym::y"), ("agent-B", "sym::z")]);
     }
@@ -265,9 +277,9 @@ mod tests {
     fn test_locks_for_agent() {
         let (_dir, store) = setup();
 
-        store.try_lock("sym::p", "agent-1", "ip", 600).unwrap();
-        store.try_lock("sym::q", "agent-1", "iq", 600).unwrap();
-        store.try_lock("sym::r", "agent-2", "ir", 600).unwrap();
+        store.try_lock("sym::p", "agent-1", "ip", 600, "write").unwrap();
+        store.try_lock("sym::q", "agent-1", "iq", 600, "write").unwrap();
+        store.try_lock("sym::r", "agent-2", "ir", 600, "write").unwrap();
 
         let agent1_locks = store.locks_for_agent("agent-1").unwrap();
         assert_eq!(agent1_locks.len(), 2);
@@ -284,16 +296,11 @@ mod tests {
     fn test_gc_expired_locks() {
         let (_dir, store) = setup();
 
-        // Lock with TTL=1 second
-        store.try_lock("sym::expire", "agent-1", "short-lived", 1).unwrap();
-
-        // Verify it exists
+        store.try_lock("sym::expire", "agent-1", "short-lived", 1, "write").unwrap();
         assert_eq!(store.all_locks().unwrap().len(), 1);
 
-        // Sleep to let it expire
         std::thread::sleep(std::time::Duration::from_secs(2));
 
-        // GC should clean it up
         let cleaned = store.gc_expired_locks().unwrap();
         assert_eq!(cleaned, 1);
         assert!(store.all_locks().unwrap().is_empty());
@@ -303,13 +310,12 @@ mod tests {
     fn test_refresh_ttl() {
         let (_dir, store) = setup();
 
-        store.try_lock("sym::m", "agent-1", "im", 300).unwrap();
-        store.try_lock("sym::n", "agent-1", "in", 300).unwrap();
+        store.try_lock("sym::m", "agent-1", "im", 300, "write").unwrap();
+        store.try_lock("sym::n", "agent-1", "in", 300, "write").unwrap();
 
         let count = store.refresh_ttl("agent-1", 900).unwrap();
         assert_eq!(count, 2);
 
-        // Verify the TTL was updated
         let locks = store.all_locks().unwrap();
         for lock in &locks {
             assert_eq!(lock.ttl_seconds, 900);
@@ -326,7 +332,7 @@ mod tests {
             let store = Arc::clone(&store);
             let handle = std::thread::spawn(move || {
                 let agent = format!("agent-{}", i);
-                store.try_lock("sym::contested", &agent, "racing", 600).unwrap()
+                store.try_lock("sym::contested", &agent, "racing", 600, "write").unwrap()
             });
             handles.push(handle);
         }
@@ -336,8 +342,82 @@ mod tests {
         let granted = results.iter().filter(|r| matches!(r, LockResult::Granted)).count();
         let blocked = results.iter().filter(|r| matches!(r, LockResult::Blocked { .. })).count();
 
-        // Exactly one thread should win the lock
         assert_eq!(granted, 1, "expected exactly 1 Granted, got {}", granted);
         assert_eq!(blocked, 9, "expected exactly 9 Blocked, got {}", blocked);
+    }
+
+    // ── Read/write lock mode tests ──
+
+    #[test]
+    fn test_read_lock_allows_multiple_readers() {
+        let (_dir, store) = setup();
+
+        let r1 = store.try_lock("sym::shared", "agent-1", "reading", 600, "read").unwrap();
+        assert!(matches!(r1, LockResult::Granted));
+
+        let r2 = store.try_lock("sym::shared", "agent-2", "also reading", 600, "read").unwrap();
+        assert!(matches!(r2, LockResult::Granted));
+
+        let r3 = store.try_lock("sym::shared", "agent-3", "reading too", 600, "read").unwrap();
+        assert!(matches!(r3, LockResult::Granted));
+
+        let locks = store.all_locks().unwrap();
+        assert_eq!(locks.len(), 3);
+        for lock in &locks {
+            assert_eq!(lock.symbol_id, "sym::shared");
+            assert_eq!(lock.mode, "read");
+        }
+    }
+
+    #[test]
+    fn test_write_lock_blocks_readers() {
+        let (_dir, store) = setup();
+
+        let r1 = store.try_lock("sym::exclusive", "agent-1", "editing", 600, "write").unwrap();
+        assert!(matches!(r1, LockResult::Granted));
+
+        let r2 = store.try_lock("sym::exclusive", "agent-2", "reading", 600, "read").unwrap();
+        assert!(matches!(r2, LockResult::Blocked { .. }));
+    }
+
+    #[test]
+    fn test_read_lock_blocks_writers() {
+        let (_dir, store) = setup();
+
+        let r1 = store.try_lock("sym::guarded", "agent-1", "reading", 600, "read").unwrap();
+        assert!(matches!(r1, LockResult::Granted));
+
+        let r2 = store.try_lock("sym::guarded", "agent-2", "editing", 600, "write").unwrap();
+        assert!(matches!(r2, LockResult::Blocked { .. }));
+    }
+
+    #[test]
+    fn test_read_lock_does_not_block_readers() {
+        let (_dir, store) = setup();
+
+        let r1 = store.try_lock("sym::open", "agent-1", "context", 600, "read").unwrap();
+        assert!(matches!(r1, LockResult::Granted));
+
+        let r2 = store.try_lock("sym::open", "agent-2", "context", 600, "read").unwrap();
+        assert!(matches!(r2, LockResult::Granted));
+
+        // But a write should be blocked
+        let r3 = store.try_lock("sym::open", "agent-3", "refactor", 600, "write").unwrap();
+        assert!(matches!(r3, LockResult::Blocked { .. }));
+    }
+
+    #[test]
+    fn test_mode_stored_in_lock_entry() {
+        let (_dir, store) = setup();
+
+        store.try_lock("sym::a", "agent-1", "reading", 600, "read").unwrap();
+        store.try_lock("sym::b", "agent-2", "writing", 600, "write").unwrap();
+
+        let locks = store.all_locks().unwrap();
+        let read_lock = locks.iter().find(|l| l.symbol_id == "sym::a").unwrap();
+        assert_eq!(read_lock.mode, "read");
+
+        let write_lock = locks.iter().find(|l| l.symbol_id == "sym::b").unwrap();
+        assert_eq!(write_lock.mode, "write");
     }
 }

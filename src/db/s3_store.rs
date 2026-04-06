@@ -143,16 +143,20 @@ impl S3LockStore {
 
     /// Conditional PUT — only succeeds if key does NOT exist.
     /// Returns true if created, false if already exists.
+    ///
+    /// Uses If-None-Match on AWS S3, falls back to GET-then-PUT for
+    /// providers that don't support conditional writes (MinIO, GCS, Azure).
     fn put_lock_if_absent(&self, entry: &LockEntry) -> Result<bool> {
         let key = self.lock_key(&entry.symbol_id);
         let body = serde_json::to_vec(entry)?;
 
+        // First try conditional PUT (native S3 / R2)
         let result = self.rt.block_on(async {
             self.client
                 .put_object()
                 .bucket(&self.bucket)
                 .key(&key)
-                .body(ByteStream::from(body))
+                .body(ByteStream::from(body.clone()))
                 .content_type("application/json")
                 .if_none_match("*")
                 .send()
@@ -160,16 +164,35 @@ impl S3LockStore {
         });
 
         match result {
-            Ok(_) => Ok(true),
-            // 412 Precondition Failed = object already exists
+            Ok(_) => return Ok(true),
+            // 412 Precondition Failed = object already exists (AWS S3 / R2)
             Err(SdkError::ServiceError(ref service_err))
                 if service_err.raw().status().as_u16() == 412 =>
             {
+                return Ok(false);
+            }
+            // Other error = provider doesn't support If-None-Match (MinIO, GCS, Azure)
+            // Fall through to check-existing approach
+            Err(_) => {}
+        }
+
+        // Fallback for providers without conditional PUT (MinIO, GCS):
+        // Use optimistic locking: write our lock, then re-read to verify ownership.
+        // If another agent also wrote, last-writer-wins — the loser detects on re-read.
+        self.put_lock(entry)?;
+
+        // Brief pause to let the write propagate (GCS is strongly consistent since 2021,
+        // but MinIO clusters may have replication lag)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Re-read to verify we own the lock
+        match self.get_lock(&entry.symbol_id)? {
+            Some(stored) if stored.agent_id == entry.agent_id => Ok(true),
+            Some(_) => {
+                // Another agent overwrote our lock — we lost
                 Ok(false)
             }
-            Err(err) => {
-                Err(anyhow::anyhow!("S3 conditional PUT failed: {}", err))
-            }
+            None => Ok(true), // Lock vanished, treat as success
         }
     }
 

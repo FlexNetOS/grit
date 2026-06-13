@@ -30,7 +30,14 @@ impl GitRepo {
 
         // Create a new branch and worktree
         let output = Command::new("git")
-            .args(["worktree", "add", "-b", &branch_name, "--", &wt_path.to_string_lossy()])
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                &branch_name,
+                "--",
+                &wt_path.to_string_lossy(),
+            ])
             .current_dir(&self.root)
             .output()
             .context("Failed to run git worktree add")?;
@@ -40,11 +47,20 @@ impl GitRepo {
             // If branch already exists, try without -b
             if stderr.contains("already exists") {
                 let output2 = Command::new("git")
-                    .args(["worktree", "add", "--", &wt_path.to_string_lossy(), &branch_name])
+                    .args([
+                        "worktree",
+                        "add",
+                        "--",
+                        &wt_path.to_string_lossy(),
+                        &branch_name,
+                    ])
                     .current_dir(&self.root)
                     .output()?;
                 if !output2.status.success() {
-                    anyhow::bail!("git worktree add failed: {}", String::from_utf8_lossy(&output2.stderr));
+                    anyhow::bail!(
+                        "git worktree add failed: {}",
+                        String::from_utf8_lossy(&output2.stderr)
+                    );
                 }
             } else {
                 anyhow::bail!("git worktree add failed: {}", stderr);
@@ -63,7 +79,13 @@ impl GitRepo {
         }
 
         let output = Command::new("git")
-            .args(["worktree", "remove", "--force", "--", &wt_path.to_string_lossy()])
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                "--",
+                &wt_path.to_string_lossy(),
+            ])
             .current_dir(&self.root)
             .output()
             .context("Failed to run git worktree remove")?;
@@ -158,7 +180,13 @@ impl GitRepo {
 
         // Merge the agent branch into current branch
         let output = Command::new("git")
-            .args(["merge", "--no-ff", &branch_name, "-m", &format!("grit: merge agent/{}", agent_id)])
+            .args([
+                "merge",
+                "--no-ff",
+                &branch_name,
+                "-m",
+                &format!("grit: merge agent/{}", agent_id),
+            ])
             .current_dir(&self.root)
             .output()
             .context("Failed to run git merge")?;
@@ -181,12 +209,18 @@ impl GitRepo {
         let max_retries = 200; // 200 × 50ms = 10s max wait
         for attempt in 0..max_retries {
             // Try to exclusively create the lock file
-            match fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+            {
                 Ok(file) => {
                     use std::io::Write;
                     let mut file = file;
                     let _ = write!(file, "{}", std::process::id());
-                    return Ok(FileLock { path: path.to_path_buf() });
+                    return Ok(FileLock {
+                        path: path.to_path_buf(),
+                    });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Check if the lock is stale:
@@ -197,7 +231,9 @@ impl GitRepo {
                         if let Ok(pid) = contents.trim().parse::<u32>() {
                             // Check if process is alive (kill with signal 0)
                             use std::process::Command as Cmd;
-                            if let Ok(output) = Cmd::new("kill").args(["-0", &pid.to_string()]).output() {
+                            if let Ok(output) =
+                                Cmd::new("kill").args(["-0", &pid.to_string()]).output()
+                            {
                                 if !output.status.success() {
                                     // Process is dead -- lock is stale
                                     is_stale = true;
@@ -262,7 +298,10 @@ impl GitRepo {
                     .current_dir(&self.root)
                     .output()?;
                 if !output2.status.success() {
-                    anyhow::bail!("git checkout failed: {}", String::from_utf8_lossy(&output2.stderr));
+                    anyhow::bail!(
+                        "git checkout failed: {}",
+                        String::from_utf8_lossy(&output2.stderr)
+                    );
                 }
             } else {
                 anyhow::bail!("git checkout -b failed: {}", stderr);
@@ -319,7 +358,11 @@ impl GitRepo {
             .current_dir(&self.root)
             .output()?;
         if !output.status.success() {
-            anyhow::bail!("git checkout {} failed: {}", branch, String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "git checkout {} failed: {}",
+                branch,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         Ok(())
     }

@@ -456,6 +456,7 @@ fn cmd_init(repo: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_claim(
     repo: &str,
     agent: &str,
@@ -470,6 +471,9 @@ fn cmd_claim(
     if mode != "read" && mode != "write" {
         anyhow::bail!("Invalid mode '{}': must be 'read' or 'write'", mode);
     }
+    if symbols.is_empty() {
+        anyhow::bail!("No symbols specified to claim (e.g. `grit claim -a <agent> -i <intent> file.rs::symbol`)");
+    }
 
     let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
@@ -480,16 +484,13 @@ fn cmd_claim(
     let symbols = if with_deps {
         let mut expanded = symbols.to_vec();
         for sym_id in symbols {
-            match db.get_transitive_deps(sym_id) {
-                Ok(deps) => {
-                    for dep in deps {
-                        if !expanded.contains(&dep) {
-                            dep_set.insert(dep.clone());
-                            expanded.push(dep);
-                        }
+            if let Ok(deps) = db.get_transitive_deps(sym_id) {
+                for dep in deps {
+                    if !expanded.contains(&dep) {
+                        dep_set.insert(dep.clone());
+                        expanded.push(dep);
                     }
                 }
-                Err(_) => {}
             }
         }
         if !dep_set.is_empty() {
@@ -685,7 +686,17 @@ fn promote_queued(
 ) -> Result<()> {
     let room = Room::new(grit_dir);
     for sym_id in symbols {
-        if let Some((next_agent, next_intent, next_mode)) = db.next_in_queue(sym_id)? {
+        // Drain the queue head for this symbol. A granted WRITE lock is
+        // exclusive, so stop after it. A granted READ lock is shared, so keep
+        // draining consecutive queued readers until the head is a writer (which
+        // will block on the readers we just granted) or the queue empties.
+        // TODO(#queue-ttl-worktree): promotion uses a hardcoded 600s TTL and
+        // does not create the promoted agent's worktree — both require storing
+        // the request TTL in lock_queue and threading GitRepo here.
+        loop {
+            let Some((next_agent, next_intent, next_mode)) = db.next_in_queue(sym_id)? else {
+                break;
+            };
             match lock_store.try_lock(sym_id, &next_agent, &next_intent, 600, &next_mode)? {
                 LockResult::Granted => {
                     db.dequeue(sym_id, &next_agent)?;
@@ -700,9 +711,15 @@ fn promote_queued(
                         agent: next_agent,
                         symbols: vec![sym_id.clone()],
                     });
+                    // Only keep draining if this was a shared read lock.
+                    if next_mode != "read" {
+                        break;
+                    }
                 }
                 LockResult::Blocked { .. } => {
-                    // Still blocked (e.g., another lock mode conflict), leave in queue
+                    // Head can't be granted yet (e.g. a writer behind readers),
+                    // leave it and the rest of the queue in place.
+                    break;
                 }
             }
         }
@@ -890,33 +907,45 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
     // to prevent orphan locks when the process crashes mid-operation.
     let git_repo = GitRepo::open(repo)?;
     let mut merge_error: Option<String> = None;
+    let mut merged = false;
 
     // Try to merge worktree back
     match git_repo.merge_worktree(agent) {
         Ok(()) => {
             println!("{} Merged branch agent/{}", "+".green(), agent);
+            merged = true;
         }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("not found") || msg.contains("does not exist") {
-                // No worktree, that's fine
+                // No worktree to merge — nothing to clean up either.
             } else {
                 merge_error = Some(msg);
             }
         }
     }
 
-    // Clean up worktree
-    match git_repo.remove_worktree(agent) {
-        Ok(()) => {
-            println!("{} Removed worktree for {}", "+".green(), agent);
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if !msg.contains("not found") && !msg.contains("does not exist") {
-                eprintln!("  warn: could not remove worktree: {}", e);
+    // Only tear down the worktree and delete the agent branch once the merge
+    // succeeded. If the merge was skipped or failed, keep both so the agent's
+    // commit stays reachable and recoverable (issue #21).
+    if merged {
+        match git_repo.remove_worktree(agent) {
+            Ok(()) => {
+                println!("{} Removed worktree for {}", "+".green(), agent);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("not found") && !msg.contains("does not exist") {
+                    eprintln!("  warn: could not remove worktree: {}", e);
+                }
             }
         }
+        let _ = git_repo.delete_agent_branch(agent);
+    } else if merge_error.is_some() {
+        eprintln!(
+            "  warn: merge skipped — keeping worktree .grit/worktrees/{} and branch agent/{} for recovery",
+            agent, agent
+        );
     }
 
     // Release locks regardless of merge outcome

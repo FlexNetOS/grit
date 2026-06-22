@@ -9,7 +9,10 @@ use super::lock_store::{LockEntry, LockResult, LockStore};
 /// Azure Blob Storage backend (native API).
 ///
 /// Uses `If-None-Match: *` on PUT for atomic lock acquisition.
-/// Events are emitted automatically via Azure Event Grid on blob create/delete.
+///
+/// Note: grit does not emit events itself. Blob create/delete can be observed
+/// in real time only if an Azure Event Grid subscription is configured on the
+/// container out of band — `grit watch` then consumes those events.
 pub struct AzureLockStore {
     client: ContainerClient,
     prefix: String,
@@ -31,6 +34,14 @@ pub struct AzureConfig {
 }
 
 const DEFAULT_PREFIX: &str = ".grit/locks/";
+
+/// Outcome of reserving the exclusive write slot for a symbol.
+enum WriteReserve {
+    /// We now hold the write slot and must still verify reader compatibility.
+    Reserved,
+    /// A terminal result was reached (own-lock refresh granted, or blocked).
+    Terminal(LockResult),
+}
 
 impl AzureLockStore {
     pub fn from_config(config: &AzureConfig) -> Result<Self> {
@@ -55,6 +66,176 @@ impl AzureLockStore {
 
     fn lock_key(&self, symbol_id: &str) -> String {
         format!("{}{}", self.prefix, urlencoding::encode(symbol_id))
+    }
+
+    /// Key for a per-agent shared READ lock. Each reader gets its own blob so
+    /// multiple readers of a symbol coexist and are tracked, released and
+    /// refreshed independently. Write locks keep the canonical `lock_key`.
+    fn reader_key(&self, symbol_id: &str, agent_id: &str) -> String {
+        format!(
+            "{}r/{}/{}",
+            self.prefix,
+            urlencoding::encode(symbol_id),
+            urlencoding::encode(agent_id)
+        )
+    }
+
+    /// The blob key that actually stores `entry` (reader keyspace for reads).
+    fn key_for_entry(&self, entry: &LockEntry) -> String {
+        if entry.mode == "read" {
+            self.reader_key(&entry.symbol_id, &entry.agent_id)
+        } else {
+            self.lock_key(&entry.symbol_id)
+        }
+    }
+
+    /// PUT a blob at an explicit key (unconditional).
+    fn put_at(&self, key: &str, entry: &LockEntry) -> Result<()> {
+        let body = serde_json::to_vec(entry)?;
+        let blob = self.client.blob_client(key);
+        self.rt
+            .block_on(async {
+                blob.put_block_blob(body)
+                    .content_type("application/json")
+                    .await
+            })
+            .context("Azure PUT failed")?;
+        Ok(())
+    }
+
+    /// DELETE a blob at an explicit key (tolerates a missing blob).
+    fn delete_at(&self, key: &str) -> Result<()> {
+        let blob = self.client.blob_client(key);
+        let result = self.rt.block_on(async { blob.delete().await });
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let s = e.to_string();
+                if s.contains("BlobNotFound") || s.contains("404") || s.contains("not found") {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Azure DELETE failed: {}", e))
+                }
+            }
+        }
+    }
+
+    /// GET and parse the blob at an explicit key, None if absent.
+    fn get_at(&self, key: &str) -> Result<Option<LockEntry>> {
+        let blob = self.client.blob_client(key);
+        let result = self.rt.block_on(async { blob.get_content().await });
+        match result {
+            Ok(data) => Ok(Some(
+                serde_json::from_slice(&data).context("Failed to parse lock entry")?,
+            )),
+            Err(e) => {
+                let s = e.to_string();
+                if s.contains("BlobNotFound") || s.contains("404") || s.contains("not found") {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Azure GET failed: {}", e))
+                }
+            }
+        }
+    }
+
+    /// List the non-expired READ locks held on `symbol_id` by other agents.
+    fn other_active_readers(&self, symbol_id: &str, agent_id: &str) -> Result<Vec<LockEntry>> {
+        let prefix = format!("{}r/{}/", self.prefix, urlencoding::encode(symbol_id));
+        let entries = self.list_under_prefix(&prefix)?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.agent_id != agent_id && !Self::is_entry_expired(e))
+            .collect())
+    }
+
+    /// Reserve the exclusive write slot for `entry`, reclaiming an expired
+    /// holder and refreshing our own existing write lock.
+    fn reserve_write_slot(&self, entry: &LockEntry) -> Result<WriteReserve> {
+        for _attempt in 0..3 {
+            if self.put_lock_if_absent(entry)? {
+                return Ok(WriteReserve::Reserved);
+            }
+            match self.get_lock(&entry.symbol_id)? {
+                Some(existing) if existing.agent_id == entry.agent_id => {
+                    self.put_lock(entry)?;
+                    return Ok(WriteReserve::Terminal(LockResult::Granted));
+                }
+                Some(existing) if Self::is_entry_expired(&existing) => {
+                    self.delete_lock(&entry.symbol_id)?;
+                }
+                Some(existing) => {
+                    return Ok(WriteReserve::Terminal(LockResult::Blocked {
+                        by_agent: existing.agent_id,
+                        by_intent: existing.intent,
+                    }));
+                }
+                None => {}
+            }
+        }
+        if let Some(holder) = self.get_lock(&entry.symbol_id)? {
+            return Ok(WriteReserve::Terminal(LockResult::Blocked {
+                by_agent: holder.agent_id,
+                by_intent: holder.intent,
+            }));
+        }
+        anyhow::bail!("Failed to acquire write lock after retries")
+    }
+
+    /// Acquire an exclusive write lock: reserve the slot, then back off if any
+    /// other agent holds an active read lock.
+    fn try_write_lock(&self, entry: &LockEntry) -> Result<LockResult> {
+        match self.reserve_write_slot(entry)? {
+            WriteReserve::Terminal(result) => Ok(result),
+            WriteReserve::Reserved => {
+                let readers = self.other_active_readers(&entry.symbol_id, &entry.agent_id)?;
+                if let Some(r) = readers.into_iter().next() {
+                    self.delete_lock(&entry.symbol_id)?;
+                    Ok(LockResult::Blocked {
+                        by_agent: r.agent_id,
+                        by_intent: r.intent,
+                    })
+                } else {
+                    Ok(LockResult::Granted)
+                }
+            }
+        }
+    }
+
+    /// Acquire a shared read lock: blocked only by another agent's active write
+    /// lock. Persists a per-agent reader blob, then re-verifies no writer
+    /// slipped in.
+    fn try_read_lock(&self, entry: &LockEntry) -> Result<LockResult> {
+        let symbol_id = &entry.symbol_id;
+        let agent_id = &entry.agent_id;
+
+        if let Some(w) = self.get_lock(symbol_id)? {
+            if w.agent_id == *agent_id {
+                return Ok(LockResult::Granted);
+            }
+            if Self::is_entry_expired(&w) {
+                self.delete_lock(symbol_id)?;
+            } else {
+                return Ok(LockResult::Blocked {
+                    by_agent: w.agent_id,
+                    by_intent: w.intent,
+                });
+            }
+        }
+
+        self.put_at(&self.reader_key(symbol_id, agent_id), entry)?;
+
+        if let Some(w) = self.get_lock(symbol_id)? {
+            if w.agent_id != *agent_id && !Self::is_entry_expired(&w) {
+                let _ = self.delete_at(&self.reader_key(symbol_id, agent_id));
+                return Ok(LockResult::Blocked {
+                    by_agent: w.agent_id,
+                    by_intent: w.intent,
+                });
+            }
+        }
+
+        Ok(LockResult::Granted)
     }
 
     fn get_lock(&self, symbol_id: &str) -> Result<Option<LockEntry>> {
@@ -160,12 +341,17 @@ impl AzureLockStore {
     }
 
     fn list_all_locks(&self) -> Result<Vec<LockEntry>> {
+        self.list_under_prefix(&self.prefix)
+    }
+
+    /// List and parse all lock blobs under an explicit key prefix.
+    fn list_under_prefix(&self, prefix: &str) -> Result<Vec<LockEntry>> {
         let result = self.rt.block_on(async {
             let mut entries = Vec::new();
             let mut stream = self
                 .client
                 .list_blobs()
-                .prefix(self.prefix.clone())
+                .prefix(prefix.to_string())
                 .into_stream();
 
             use futures::StreamExt;
@@ -212,49 +398,17 @@ impl LockStore for AzureLockStore {
             mode: mode.to_string(),
         };
 
-        // Atomic PUT (If-None-Match: * — native Azure support)
-        if self.put_lock_if_absent(&entry)? {
-            return Ok(LockResult::Granted);
+        if mode == "read" {
+            self.try_read_lock(&entry)
+        } else {
+            self.try_write_lock(&entry)
         }
-
-        // Blob exists — check who holds it
-        if let Some(existing) = self.get_lock(symbol_id)? {
-            if existing.agent_id == agent_id {
-                self.put_lock(&entry)?;
-                return Ok(LockResult::Granted);
-            }
-
-            if Self::is_entry_expired(&existing) {
-                self.delete_lock(symbol_id)?;
-                if self.put_lock_if_absent(&entry)? {
-                    return Ok(LockResult::Granted);
-                }
-                if let Some(new_existing) = self.get_lock(symbol_id)? {
-                    return Ok(LockResult::Blocked {
-                        by_agent: new_existing.agent_id,
-                        by_intent: new_existing.intent,
-                    });
-                }
-            }
-
-            if mode == "read" && existing.mode == "read" {
-                return Ok(LockResult::Granted);
-            }
-
-            return Ok(LockResult::Blocked {
-                by_agent: existing.agent_id,
-                by_intent: existing.intent,
-            });
-        }
-
-        if self.put_lock_if_absent(&entry)? {
-            return Ok(LockResult::Granted);
-        }
-
-        anyhow::bail!("Failed to acquire lock after retries")
     }
 
     fn release(&self, symbol_id: &str, agent_id: &str) -> Result<()> {
+        // Release whichever lock the agent owns (per-agent read blob or the
+        // canonical write blob). Reader deletion is idempotent.
+        let _ = self.delete_at(&self.reader_key(symbol_id, agent_id));
         if let Some(entry) = self.get_lock(symbol_id)? {
             if entry.agent_id == agent_id {
                 self.delete_lock(symbol_id)?;
@@ -268,7 +422,7 @@ impl LockStore for AzureLockStore {
         let mut count = 0;
         for entry in &all {
             if entry.agent_id == agent_id {
-                self.delete_lock(&entry.symbol_id)?;
+                self.delete_at(&self.key_for_entry(entry))?;
                 count += 1;
             }
         }
@@ -297,7 +451,7 @@ impl LockStore for AzureLockStore {
         let mut count = 0;
         for entry in &all {
             if Self::is_entry_expired(entry) {
-                self.delete_lock(&entry.symbol_id)?;
+                self.delete_at(&self.key_for_entry(entry))?;
                 count += 1;
             }
         }
@@ -310,13 +464,24 @@ impl LockStore for AzureLockStore {
         let mut count = 0;
         for entry in all {
             if entry.agent_id == agent_id {
-                let updated = LockEntry {
-                    locked_at: now.clone(),
-                    ttl_seconds,
-                    ..entry
-                };
-                self.put_lock(&updated)?;
-                count += 1;
+                let key = self.key_for_entry(&entry);
+                // Re-GET before refreshing so a concurrently released/stolen
+                // lock is not resurrected by an unconditional PUT. Only refresh
+                // when it still exists and is still ours.
+                match self.get_at(&key)? {
+                    Some(current) if current.agent_id == agent_id => {
+                        let updated = LockEntry {
+                            locked_at: now.clone(),
+                            ttl_seconds,
+                            ..entry
+                        };
+                        self.put_at(&key, &updated)?;
+                        count += 1;
+                    }
+                    _ => {
+                        // Released or taken over — do not resurrect.
+                    }
+                }
             }
         }
         Ok(count)

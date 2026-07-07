@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use colored::Colorize;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::GritConfig;
 use crate::db::azure_store::AzureConfig;
@@ -160,6 +161,19 @@ pub enum Command {
         /// Lock mode: "read" for shared access, "write" for exclusive (default: write)
         #[arg(long, default_value = "write")]
         mode: String,
+    },
+
+    /// Reconcile two source roots by partitioning identical and divergent symbols
+    Reconcile {
+        /// Try to lock divergent symbols in the current grit repo when initialized
+        #[arg(long)]
+        lock_conflicts: bool,
+
+        /// First source root
+        a: String,
+
+        /// Second source root
+        b: String,
     },
 
     /// Refresh an agent's lock TTL
@@ -358,6 +372,11 @@ pub fn run(cli: Cli) -> Result<()> {
             ttl,
             mode,
         } => cmd_assign(&cli.repo, &agent, &intent, &file, ttl, &mode),
+        Command::Reconcile {
+            lock_conflicts,
+            a,
+            b,
+        } => cmd_reconcile(&cli.repo, &a, &b, lock_conflicts),
     }
 }
 
@@ -409,6 +428,125 @@ fn resolve_lock_store(repo: &str) -> Result<Box<dyn LockStore>> {
             Ok(Box::new(store))
         }
     }
+}
+
+#[derive(Debug)]
+struct ReconcilePartition {
+    identical: Vec<String>,
+    conflicts: Vec<String>,
+    only_a: Vec<String>,
+    only_b: Vec<String>,
+}
+
+fn cmd_reconcile(repo: &str, a: &str, b: &str, lock_conflicts: bool) -> Result<()> {
+    let left = SymbolIndex::new(a)?;
+    let right = SymbolIndex::new(b)?;
+    let left_symbols = left.scan_all()?;
+    let right_symbols = right.scan_all()?;
+
+    let left_by_id: BTreeMap<_, _> = left_symbols
+        .iter()
+        .map(|symbol| (symbol.id.clone(), symbol))
+        .collect();
+    let right_by_id: BTreeMap<_, _> = right_symbols
+        .iter()
+        .map(|symbol| (symbol.id.clone(), symbol))
+        .collect();
+
+    let mut ids = BTreeSet::new();
+    ids.extend(left_by_id.keys().cloned());
+    ids.extend(right_by_id.keys().cloned());
+
+    let mut partition = ReconcilePartition {
+        identical: Vec::new(),
+        conflicts: Vec::new(),
+        only_a: Vec::new(),
+        only_b: Vec::new(),
+    };
+
+    for id in ids {
+        match (left_by_id.get(&id), right_by_id.get(&id)) {
+            (Some(left), Some(right)) if left.hash == right.hash => partition.identical.push(id),
+            (Some(_), Some(_)) => partition.conflicts.push(id),
+            (Some(_), None) => partition.only_a.push(id),
+            (None, Some(_)) => partition.only_b.push(id),
+            (None, None) => {}
+        }
+    }
+
+    println!("reconcile {}", "+".green());
+    println!("  root-a: {}", a);
+    println!("  root-b: {}", b);
+    println!("  auto-mergeable: {}", partition.identical.len());
+    for id in &partition.identical {
+        println!("    {} {}", "=".green(), id);
+    }
+    println!("  conflicts: {}", partition.conflicts.len());
+    for id in &partition.conflicts {
+        println!("    {} {}", "!".yellow(), id);
+    }
+    if !partition.only_a.is_empty() {
+        println!("  only-a: {}", partition.only_a.len());
+        for id in &partition.only_a {
+            println!("    {} {}", "<".cyan(), id);
+        }
+    }
+    if !partition.only_b.is_empty() {
+        println!("  only-b: {}", partition.only_b.len());
+        for id in &partition.only_b {
+            println!("    {} {}", ">".cyan(), id);
+        }
+    }
+
+    if lock_conflicts {
+        println!("  lock-conflicts: {}", partition.conflicts.len());
+        if partition.conflicts.is_empty() {
+            return Ok(());
+        }
+
+        match resolve_lock_store(repo) {
+            Ok(lock_store) => {
+                for id in &partition.conflicts {
+                    match lock_store.try_lock(
+                        id,
+                        "reconcile",
+                        "union-step-2 conflicting symbol",
+                        600,
+                        "write",
+                    )? {
+                        LockResult::Granted => {
+                            println!("    {} locked {}", "+".green(), id);
+                        }
+                        LockResult::Blocked {
+                            by_agent,
+                            by_intent,
+                        } => {
+                            println!(
+                                "    {} blocked {} -- held by {} ({})",
+                                "x".red(),
+                                id,
+                                by_agent,
+                                by_intent
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                println!(
+                    "    {} no initialized grit registry in {}: {}",
+                    "~".yellow(),
+                    repo,
+                    err
+                );
+                for id in &partition.conflicts {
+                    println!("    {} lock-target {}", ">".yellow(), id);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_init(repo: &str) -> Result<()> {

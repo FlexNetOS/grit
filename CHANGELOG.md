@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.3](https://github.com/FlexNetOS/grit/compare/grit-v0.6.2...grit-v0.6.3) (2026-07-07)
+
+
+### Bug Fixes
+
+* **ci:** skip upstream homebrew publish in forks ([7ab5112](https://github.com/FlexNetOS/grit/commit/7ab5112cfdb9701bb6c405ac7e6ac26cd53997f5))
+
 ## [0.6.2](https://github.com/FlexNetOS/grit/compare/grit-v0.6.1...grit-v0.6.2) (2026-07-07)
 
 

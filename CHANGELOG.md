@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/FlexNetOS/grit/compare/v0.5.0...v0.6.0) (2026-07-07)
+
+
+### Features
+
+* add symbol reconciliation command ([9698e59](https://github.com/FlexNetOS/grit/commit/9698e59a674a70c19d4d6035eccd49efa94e096c))
+* add union-step-2 symbol reconciliation ([c23c072](https://github.com/FlexNetOS/grit/commit/c23c072071bac5bf5cfd279599af1bc1ced16d53))
+
 ## [0.5.0](https://github.com/FlexNetOS/grit/compare/v0.4.0...v0.5.0) (2026-06-27)
 
 

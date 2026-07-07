@@ -84,11 +84,21 @@ jobs:
               -m "chore: back-merge master into develop (${TAG})"
           fi
 
+          if git diff --quiet origin/develop..HEAD; then
+            echo "develop already contains origin/master; skipping back-merge PR."
+            exit 0
+          fi
+
           git push origin "$BRANCH"
+
+          label_args=()
+          if gh label list --search "automated" --json name --jq '.[].name' | grep -qx automated; then
+            label_args=(--label "automated")
+          fi
 
           gh pr create \
             --base develop \
             --head "$BRANCH" \
             --title "chore: sync release ${TAG} into develop" \
             --body "Automated back-merge of release-please commits from \`master\` into \`develop\` so the next \`develop -> master\` PR stays free of release-commit drift." \
-            --label "automated"
+            "${label_args[@]}"

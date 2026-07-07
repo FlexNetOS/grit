@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/FlexNetOS/grit/compare/v0.6.0...v0.6.1) (2026-07-07)
+
+
+### Bug Fixes
+
+* **ci:** draft release before asset upload ([4ab1890](https://github.com/FlexNetOS/grit/commit/4ab18904a95984d4db163e99731e7d8f28a42301))
+
 ## [0.6.0](https://github.com/FlexNetOS/grit/compare/v0.5.0...v0.6.0) (2026-07-07)
 
 

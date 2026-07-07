@@ -11,6 +11,10 @@ permissions:
 
 jobs:
   release-please:
+    # FlexNetOS is a fork/integration mirror; upstream rtk-ai/grit is the release authority.
+    # Running release-please in the fork creates untagged draft releases and recursive
+    # release PRs before hosted macOS assets finish. Keep fork validation local/CI-only.
+    if: ${{ github.repository == 'rtk-ai/grit' }}
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
